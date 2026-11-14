@@ -1,0 +1,96 @@
+name: Windows TorBox portable build
+
+on:
+  push:
+    branches:
+      - torbox-windows-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: torbox-windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify TorBox account integration
+        shell: pwsh
+        run: |
+          $debrid = Get-Content crates/debrid/src/lib.rs -Raw
+          $options = Get-Content crates/app/src/options.rs -Raw
+          $torbox = Get-Content crates/debrid/src/torbox.rs -Raw
+          $tests = Get-Content crates/debrid/tests/services.rs -Raw
+          if ($debrid -notmatch 'ServiceKind::TorBox' -or $debrid -notmatch 'pub mod torbox') { throw "TorBox service is not registered in the debrid module" }
+          if ($options -notmatch 'mdm_debrid::ServiceKind::ALL') { throw "Accounts UI is not bound to available debrid services" }
+          if ($torbox -notmatch 'https://api.torbox.app/v1/api/') { throw "TorBox API integration is missing" }
+          if ($tests -notmatch 'torbox_links_come_through_the_account_once_it_has_the_file') { throw "TorBox integration test is missing" }
+          Write-Output "TorBox integration verified for Options > Accounts > Add..."
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Install NASM for BoringSSL
+        shell: pwsh
+        run: |
+          choco install nasm --version 2.16.3 --no-progress -y
+          "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Ensure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build release executable and portable package
+        shell: pwsh
+        run: |
+          ./tools/installer/build.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed: $LASTEXITCODE" }
+
+      - name: Verify packages contain the Windows executable
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression
+          $portable = Get-ChildItem target/dist/*-portable.zip | Select-Object -First 1
+          $setup = Get-ChildItem target/dist/*-setup.exe | Select-Object -First 1
+          if (-not $portable -or -not $setup) { throw "Windows build missing portable zip or installer" }
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($portable.FullName)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+            if (-not ($entries | Where-Object { $_ -match '/misterdownloadmanager\.exe$' })) { throw "Portable zip is missing misterdownloadmanager.exe" }
+            if (-not ($entries | Where-Object { $_ -match '/data/README\.txt$' })) { throw "Portable zip is missing its portable-mode data marker" }
+          } finally {
+            $archive.Dispose()
+          }
+          Get-ChildItem target/dist -File | ForEach-Object {
+            Write-Output "$($_.Name) $($_.Length) bytes"
+            Get-FileHash -Algorithm SHA256 $_.FullName | Format-List
+          }
+
+      - name: Upload Windows installer and portable archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: misterdownloadmanager-torbox-windows
+          path: |
+            target/dist/*-setup.exe
+            target/dist/*-portable.zip
+            target/dist/*-x64.zip
+            target/dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
